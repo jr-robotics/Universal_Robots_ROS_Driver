@@ -102,7 +102,7 @@ $ source /opt/ros/<your_ros_version>/setup.bash
 $ mkdir -p catkin_ws/src && cd catkin_ws
 
 # clone the driver
-$ git clone https://github.com/UniversalRobots/Universal_Robots_ROS_Driver.git src/Universal_Robots_ROS_Driver
+$ git clone -b jr-playground-master https://github.com/jr-robotics/Universal_Robots_ROS_Driver.git src/Universal_Robots_ROS_Driver
 
 # clone fork of the description to use the calibration feature
 $ git clone -b calibration_devel https://github.com/fmauch/universal_robot.git src/fmauch_universal_robot
