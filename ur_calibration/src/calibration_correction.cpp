@@ -80,14 +80,14 @@ public:
 
   void run()
   {
-    comm::URStream<PackageHeader> stream(robot_ip_, UR_PRIMARY_PORT);
+    comm::URStream<PrimaryPackage> stream(robot_ip_, UR_PRIMARY_PORT);
     primary_interface::PrimaryParser parser;
-    comm::URProducer<PackageHeader> prod(stream, parser);
+    comm::URProducer<PrimaryPackage> prod(stream, parser);
     CalibrationConsumer consumer;
 
     comm::INotifier notifier;
 
-    comm::Pipeline<PackageHeader> pipeline(prod, consumer, "Pipeline", notifier);
+    comm::Pipeline<PrimaryPackage> pipeline(prod, &consumer, "Pipeline", notifier);
     pipeline.run();
     while (!consumer.isCalibrated())
     {
@@ -174,6 +174,10 @@ int main(int argc, char* argv[])
     ROS_INFO("Calibration correction done");
   }
   catch (const UrException& e)
+  {
+    ROS_ERROR_STREAM(e.what());
+  }
+  catch (const std::exception& e)
   {
     ROS_ERROR_STREAM(e.what());
   }

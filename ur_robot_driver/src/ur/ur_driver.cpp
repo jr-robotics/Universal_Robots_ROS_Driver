@@ -52,7 +52,7 @@ ur_driver::UrDriver::UrDriver(const std::string& robot_ip, const std::string& sc
                               std::function<void(bool)> handle_program_state, bool headless_mode,
                               std::unique_ptr<ToolCommSetup> tool_comm_setup, const std::string& calibration_checksum,
                               const uint32_t reverse_port, const uint32_t script_sender_port, int servoj_gain,
-                              double servoj_lookahead_time)
+                              double servoj_lookahead_time, bool non_blocking_read)
   : servoj_time_(0.008)
   , servoj_gain_(servoj_gain)
   , servoj_lookahead_time_(servoj_lookahead_time)
@@ -65,13 +65,16 @@ ur_driver::UrDriver::UrDriver(const std::string& robot_ip, const std::string& sc
   LOG_DEBUG("Initializing RTDE client");
   rtde_client_.reset(new rtde_interface::RTDEClient(robot_ip_, notifier_, output_recipe_file, input_recipe_file));
 
-  primary_stream_.reset(new comm::URStream<ur_driver::primary_interface::PackageHeader>(
-      robot_ip_, ur_driver::primary_interface::UR_PRIMARY_PORT));
-  secondary_stream_.reset(new comm::URStream<ur_driver::primary_interface::PackageHeader>(
+  primary_stream_.reset(
+      new comm::URStream<primary_interface::PrimaryPackage>(robot_ip_, ur_driver::primary_interface::UR_PRIMARY_PORT));
+  secondary_stream_.reset(new comm::URStream<primary_interface::PrimaryPackage>(
       robot_ip_, ur_driver::primary_interface::UR_SECONDARY_PORT));
   secondary_stream_->connect();
   LOG_INFO("Checking if calibration data matches connected robot.");
   checkCalibration(calibration_checksum);
+
+  non_blocking_read_ = non_blocking_read;
+  get_packet_timeout_ = non_blocking_read_ ? 0 : 100;
 
   if (!rtde_client_->init())
   {
@@ -84,13 +87,27 @@ ur_driver::UrDriver::UrDriver(const std::string& robot_ip, const std::string& sc
   std::string local_ip = rtde_client_->getIP();
 
   std::string prog = readScriptFile(script_file);
-  prog.replace(prog.find(JOINT_STATE_REPLACE), JOINT_STATE_REPLACE.length(), std::to_string(MULT_JOINTSTATE));
+  while (prog.find(JOINT_STATE_REPLACE) != std::string::npos)
+  {
+    prog.replace(prog.find(JOINT_STATE_REPLACE), JOINT_STATE_REPLACE.length(), std::to_string(MULT_JOINTSTATE));
+  }
+
   std::ostringstream out;
   out << "lookahead_time=" << servoj_lookahead_time_ << ", gain=" << servoj_gain_;
-  prog.replace(prog.find(SERVO_J_REPLACE), SERVO_J_REPLACE.length(), out.str());
-  prog.replace(prog.find(SERVO_J_REPLACE), SERVO_J_REPLACE.length(), out.str());
-  prog.replace(prog.find(SERVER_IP_REPLACE), SERVER_IP_REPLACE.length(), local_ip);
-  prog.replace(prog.find(SERVER_PORT_REPLACE), SERVER_PORT_REPLACE.length(), std::to_string(reverse_port));
+  while (prog.find(SERVO_J_REPLACE) != std::string::npos)
+  {
+    prog.replace(prog.find(SERVO_J_REPLACE), SERVO_J_REPLACE.length(), out.str());
+  }
+
+  while (prog.find(SERVER_IP_REPLACE) != std::string::npos)
+  {
+    prog.replace(prog.find(SERVER_IP_REPLACE), SERVER_IP_REPLACE.length(), local_ip);
+  }
+
+  while (prog.find(SERVER_PORT_REPLACE) != std::string::npos)
+  {
+    prog.replace(prog.find(SERVER_PORT_REPLACE), SERVER_PORT_REPLACE.length(), std::to_string(reverse_port));
+  }
 
   robot_version_ = rtde_client_->getVersion();
 
@@ -142,16 +159,19 @@ ur_driver::UrDriver::UrDriver(const std::string& robot_ip, const std::string& sc
 
 std::unique_ptr<rtde_interface::DataPackage> ur_driver::UrDriver::getDataPackage()
 {
-  std::chrono::milliseconds timeout(100);  // We deliberately have a quite large timeout here, as the robot itself
-                                           // should command the control loop's timing.
+  // This can take one of two values, 0ms or 100ms. The large timeout is for when the robot is commanding the control
+  // loop's timing (read is blocking). The zero timeout is for when the robot is sharing a control loop with
+  // something else (combined_robot_hw)
+  std::chrono::milliseconds timeout(get_packet_timeout_);
+
   return rtde_client_->getDataPackage(timeout);
 }
 
-bool UrDriver::writeJointCommand(const vector6d_t& values)
+bool UrDriver::writeJointCommand(const vector6d_t& values, const comm::ControlMode control_mode)
 {
   if (reverse_interface_active_)
   {
-    return reverse_interface_->write(&values);
+    return reverse_interface_->write(&values, control_mode);
   }
   return false;
 }
@@ -161,7 +181,7 @@ bool UrDriver::writeKeepalive()
   if (reverse_interface_active_)
   {
     vector6d_t* fake = nullptr;
-    return reverse_interface_->write(fake, 1);
+    return reverse_interface_->write(fake, comm::ControlMode::MODE_IDLE);
   }
   return false;
 }
@@ -176,7 +196,7 @@ bool UrDriver::stopControl()
   if (reverse_interface_active_)
   {
     vector6d_t* fake = nullptr;
-    return reverse_interface_->write(fake, 0);
+    return reverse_interface_->write(fake, comm::ControlMode::MODE_STOPPED);
   }
   return false;
 }
@@ -241,21 +261,21 @@ void UrDriver::checkCalibration(const std::string& checksum)
     throw std::runtime_error("checkCalibration() called without a primary interface connection being established.");
   }
   primary_interface::PrimaryParser parser;
-  comm::URProducer<ur_driver::primary_interface::PackageHeader> prod(*primary_stream_, parser);
+  comm::URProducer<primary_interface::PrimaryPackage> prod(*primary_stream_, parser);
   prod.setupProducer();
 
   CalibrationChecker consumer(checksum);
 
   comm::INotifier notifier;
 
-  comm::Pipeline<ur_driver::primary_interface::PackageHeader> pipeline(prod, consumer, "Pipeline", notifier);
+  comm::Pipeline<primary_interface::PrimaryPackage> pipeline(prod, &consumer, "Pipeline", notifier);
   pipeline.run();
 
   while (!consumer.isChecked())
   {
-    ros::Duration(1).sleep();
+    std::this_thread::sleep_for(std::chrono::seconds(1));
   }
-  ROS_DEBUG_STREAM("Got calibration information from robot.");
+  LOG_DEBUG("Got calibration information from robot.");
 }
 
 rtde_interface::RTDEWriter& UrDriver::getRTDEWriter()

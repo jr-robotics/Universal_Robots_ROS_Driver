@@ -79,7 +79,7 @@ uint16_t RTDEClient::negotiateProtocolVersion()
   size = RequestProtocolVersionRequest::generateSerializedRequest(buffer, protocol_version);
   if (!stream_.write(buffer, size, written))
     throw UrException("Sending protocol version query to robot failed.");
-  std::unique_ptr<comm::URPackage<PackageHeader>> package;
+  std::unique_ptr<RTDEPackage> package;
   if (!pipeline_.getLatestProduct(package, std::chrono::milliseconds(1000)))
     throw UrException("Could not get urcontrol version from robot. This should not happen!");
   rtde_interface::RequestProtocolVersion* tmp_version =
@@ -106,7 +106,7 @@ void RTDEClient::queryURControlVersion()
   uint8_t buffer[4096];
   size_t size;
   size_t written;
-  std::unique_ptr<comm::URPackage<PackageHeader>> package;
+  std::unique_ptr<RTDEPackage> package;
   size = GetUrcontrolVersionRequest::generateSerializedRequest(buffer);
   if (!stream_.write(buffer, size, written))
     throw UrException("Sending urcontrol version query request to robot failed.");
@@ -127,7 +127,7 @@ void RTDEClient::setupOutputs(const uint16_t protocol_version)
   size_t size;
   size_t written;
   uint8_t buffer[4096];
-  std::unique_ptr<comm::URPackage<PackageHeader>> package;
+  std::unique_ptr<RTDEPackage> package;
   LOG_INFO("Setting up RTDE communication with frequency %f", max_frequency_);
   if (protocol_version == 2)
   {
@@ -142,7 +142,25 @@ void RTDEClient::setupOutputs(const uint16_t protocol_version)
   if (!stream_.write(buffer, size, written))
     throw UrException("Could not send RTDE output recipe to robot.");
   if (!pipeline_.getLatestProduct(package, std::chrono::milliseconds(1000)))
+  {
     throw UrException("Did not receive confirmation on RTDE output recipe.");
+  }
+
+  rtde_interface::ControlPackageSetupOutputs* tmp_output =
+      dynamic_cast<rtde_interface::ControlPackageSetupOutputs*>(package.get());
+
+  std::vector<std::string> variable_types = splitVariableTypes(tmp_output->variable_types_);
+  assert(output_recipe_.size() == variable_types.size());
+  for (std::size_t i = 0; i < variable_types.size(); ++i)
+  {
+    LOG_DEBUG("%s confirmed as datatype: %s", output_recipe_[i].c_str(), variable_types[i].c_str());
+    if (variable_types[i] == "NOT_FOUND")
+    {
+      std::string message = "Variable '" + output_recipe_[i] +
+                            "' not recognized by the robot. Probably your output recipe contains errors";
+      throw UrException(message);
+    }
+  }
 }
 
 void RTDEClient::setupInputs()
@@ -150,7 +168,7 @@ void RTDEClient::setupInputs()
   size_t size;
   size_t written;
   uint8_t buffer[4096];
-  std::unique_ptr<comm::URPackage<PackageHeader>> package;
+  std::unique_ptr<RTDEPackage> package;
   size = ControlPackageSetupInputsRequest::generateSerializedRequest(buffer, input_recipe_);
   if (!stream_.write(buffer, size, written))
     throw UrException("Could not send RTDE input recipe to robot.");
@@ -163,6 +181,26 @@ void RTDEClient::setupInputs()
     throw UrException("Could not setup RTDE inputs.");
   }
 
+  std::vector<std::string> variable_types = splitVariableTypes(tmp_input->variable_types_);
+  assert(input_recipe_.size() == variable_types.size());
+  for (std::size_t i = 0; i < variable_types.size(); ++i)
+  {
+    LOG_DEBUG("%s confirmed as datatype: %s", input_recipe_[i].c_str(), variable_types[i].c_str());
+    if (variable_types[i] == "NOT_FOUND")
+    {
+      std::string message =
+          "Variable '" + input_recipe_[i] + "' not recognized by the robot. Probably your input recipe contains errors";
+      throw UrException(message);
+    }
+    else if (variable_types[i] == "IN_USE")
+    {
+      std::string message = "Variable '" + input_recipe_[i] +
+                            "' is currently controlled by another RTDE client. The input recipe can't be used as "
+                            "configured";
+      throw UrException(message);
+    }
+  }
+
   writer_.init(tmp_input->input_recipe_id_);
 }
 
@@ -173,11 +211,12 @@ bool RTDEClient::start()
   size_t written;
   pipeline_.run();
   size = ControlPackageStartRequest::generateSerializedRequest(buffer);
-  std::unique_ptr<comm::URPackage<PackageHeader>> package;
+  std::unique_ptr<RTDEPackage> package;
   if (!stream_.write(buffer, size, written))
     throw UrException("Sending RTDE start command failed!");
   if (!pipeline_.getLatestProduct(package, std::chrono::milliseconds(1000)))
-    throw UrException("Could not get response to RTDE communication start request from robot. This should not happen!");
+    throw UrException("Could not get response to RTDE communication start request from robot. This should not "
+                      "happen!");
   rtde_interface::ControlPackageStart* tmp = dynamic_cast<rtde_interface::ControlPackageStart*>(package.get());
   return tmp->accepted_;
 }
@@ -195,7 +234,7 @@ std::vector<std::string> RTDEClient::readRecipe(const std::string& recipe_file)
 
 std::unique_ptr<rtde_interface::DataPackage> RTDEClient::getDataPackage(std::chrono::milliseconds timeout)
 {
-  std::unique_ptr<comm::URPackage<rtde_interface::PackageHeader>> urpackage;
+  std::unique_ptr<RTDEPackage> urpackage;
   if (pipeline_.getLatestProduct(urpackage, timeout))
   {
     rtde_interface::DataPackage* tmp = dynamic_cast<rtde_interface::DataPackage*>(urpackage.get());
@@ -216,6 +255,18 @@ std::string RTDEClient::getIP() const
 RTDEWriter& RTDEClient::getWriter()
 {
   return writer_;
+}
+
+std::vector<std::string> RTDEClient::splitVariableTypes(const std::string& variable_types) const
+{
+  std::vector<std::string> result;
+  std::stringstream ss(variable_types);
+  std::string substr = "";
+  while (getline(ss, substr, ','))
+  {
+    result.push_back(substr);
+  }
+  return result;
 }
 }  // namespace rtde_interface
 }  // namespace ur_driver

@@ -31,10 +31,23 @@
 
 #include <Eigen/Geometry>
 
+using industrial_robot_status_interface::RobotMode;
+using industrial_robot_status_interface::TriState;
+using namespace ur_driver::rtde_interface;
+
 namespace ur_driver
 {
+// bitset mask is applied to robot safety status bits in order to determine 'in_error' state
+static const std::bitset<11> in_error_bitset_(1 << toUnderlying(UrRtdeSafetyStatusBits::IS_PROTECTIVE_STOPPED) |
+                                              1 << toUnderlying(UrRtdeSafetyStatusBits::IS_ROBOT_EMERGENCY_STOPPED) |
+                                              1 << toUnderlying(UrRtdeSafetyStatusBits::IS_EMERGENCY_STOPPED) |
+                                              1 << toUnderlying(UrRtdeSafetyStatusBits::IS_VIOLATION) |
+                                              1 << toUnderlying(UrRtdeSafetyStatusBits::IS_FAULT) |
+                                              1 << toUnderlying(UrRtdeSafetyStatusBits::IS_STOPPED_DUE_TO_SAFETY));
+
 HardwareInterface::HardwareInterface()
   : joint_position_command_({ 0, 0, 0, 0, 0, 0 })
+  , joint_velocity_command_({ 0, 0, 0, 0, 0, 0 })
   , joint_positions_{ { 0, 0, 0, 0, 0, 0 } }
   , joint_velocities_{ { 0, 0, 0, 0, 0, 0 } }
   , joint_efforts_{ { 0, 0, 0, 0, 0, 0 } }
@@ -44,6 +57,7 @@ HardwareInterface::HardwareInterface()
   , safety_mode_(ur_dashboard_msgs::SafetyMode::NORMAL)
   , runtime_state_(static_cast<uint32_t>(rtde_interface::RUNTIME_STATE::STOPPED))
   , position_controller_running_(false)
+  , velocity_controller_running_(false)
   , pausing_state_(PausingState::RUNNING)
   , pausing_ramp_up_increment_(0.01)
   , controllers_initialized_(false)
@@ -71,6 +85,8 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
   // The driver will offer an interface to receive the program's URScript on this port.
   int script_sender_port = robot_hw_nh.param("script_sender_port", 50002);
 
+  // When the robot's URDF is being loaded with a prefix, we need to know it here, as well, in order
+  // to publish correct frame names for frames reported by the robot directly.
   robot_hw_nh.param<std::string>("tf_prefix", tf_prefix_, "");
 
   // Path to the urscript code that will be sent to the robot.
@@ -103,6 +119,11 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
     ROS_ERROR_STREAM("Required parameter " << robot_hw_nh.resolveName("headless_mode") << " not given.");
     return false;
   }
+
+  // Enables non_blocking_read mode. Should only be used with combined_robot_hw. Disables error generated when read
+  // returns without any data, sets the read timeout to zero, and synchronises read/write operations. Enabling this when
+  // not used with combined_robot_hw can suppress important errors and affect real-time performance.
+  robot_hw_nh.param("non_blocking_read", non_blocking_read_, false);
 
   // Specify gain for servoing to position in joint space.
   // A higher gain can sharpen the trajectory.
@@ -233,7 +254,7 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
                                   std::bind(&HardwareInterface::handleRobotProgramState, this, std::placeholders::_1),
                                   headless_mode, std::move(tool_comm_setup), calibration_checksum,
                                   (uint32_t)reverse_port, (uint32_t)script_sender_port, servoj_gain,
-                                  servoj_lookahead_time));
+                                  servoj_lookahead_time, non_blocking_read_));
   }
   catch (ur_driver::ToolCommNotAvailable& e)
   {
@@ -276,8 +297,12 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
     // Create joint position control interface
     pj_interface_.registerHandle(
         hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[i]), &joint_position_command_[i]));
+    vj_interface_.registerHandle(
+        hardware_interface::JointHandle(js_interface_.getHandle(joint_names_[i]), &joint_velocity_command_[i]));
     spj_interface_.registerHandle(ur_controllers::ScaledJointHandle(
         js_interface_.getHandle(joint_names_[i]), &joint_position_command_[i], &speed_scaling_combined_));
+    svj_interface_.registerHandle(ur_controllers::ScaledJointHandle(
+        js_interface_.getHandle(joint_names_[i]), &joint_velocity_command_[i], &speed_scaling_combined_));
   }
 
   speedsc_interface_.registerHandle(
@@ -286,12 +311,18 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
   fts_interface_.registerHandle(hardware_interface::ForceTorqueSensorHandle(
       "wrench", tf_prefix_ + "tool0_controller", fts_measurements_.begin(), fts_measurements_.begin() + 3));
 
+  robot_status_interface_.registerHandle(industrial_robot_status_interface::IndustrialRobotStatusHandle(
+      "industrial_robot_status_handle", robot_status_resource_));
+
   // Register interfaces
   registerInterface(&js_interface_);
   registerInterface(&spj_interface_);
   registerInterface(&pj_interface_);
+  registerInterface(&vj_interface_);
+  registerInterface(&svj_interface_);
   registerInterface(&speedsc_interface_);
   registerInterface(&fts_interface_);
+  registerInterface(&robot_status_interface_);
 
   tcp_pose_pub_.reset(new realtime_tools::RealtimePublisher<tf2_msgs::TFMessage>(root_nh, "/tf", 100));
   io_pub_.reset(new realtime_tools::RealtimePublisher<ur_msgs::IOStates>(robot_hw_nh, "io_states", 1));
@@ -377,9 +408,19 @@ void HardwareInterface::readBitsetData(const std::unique_ptr<rtde_interface::Dat
 
 void HardwareInterface::read(const ros::Time& time, const ros::Duration& period)
 {
+  // set defaults
+  robot_status_resource_.mode = RobotMode::UNKNOWN;
+  robot_status_resource_.e_stopped = TriState::UNKNOWN;
+  robot_status_resource_.drives_powered = TriState::UNKNOWN;
+  robot_status_resource_.motion_possible = TriState::UNKNOWN;
+  robot_status_resource_.in_motion = TriState::UNKNOWN;
+  robot_status_resource_.in_error = TriState::UNKNOWN;
+  robot_status_resource_.error_code = 0;
+
   std::unique_ptr<rtde_interface::DataPackage> data_pkg = ur_driver_->getDataPackage();
   if (data_pkg)
   {
+    packet_read_ = true;
     readData(data_pkg, "actual_q", joint_positions_);
     readData(data_pkg, "actual_qd", joint_velocities_);
     readData(data_pkg, "target_speed_fraction", target_speed_fraction_);
@@ -399,10 +440,15 @@ void HardwareInterface::read(const ros::Time& time, const ros::Duration& period)
     readData(data_pkg, "tool_temperature", tool_temperature_);
     readData(data_pkg, "robot_mode", robot_mode_);
     readData(data_pkg, "safety_mode", safety_mode_);
+    readBitsetData<uint32_t>(data_pkg, "robot_status_bits", robot_status_bits_);
+    readBitsetData<uint32_t>(data_pkg, "safety_status_bits", safety_status_bits_);
+    readData(data_pkg, "actual_current", joint_efforts_);
     readBitsetData<uint64_t>(data_pkg, "actual_digital_input_bits", actual_dig_in_bits_);
     readBitsetData<uint64_t>(data_pkg, "actual_digital_output_bits", actual_dig_out_bits_);
     readBitsetData<uint32_t>(data_pkg, "analog_io_types", analog_io_types_);
     readBitsetData<uint32_t>(data_pkg, "tool_analog_input_types", tool_analog_input_types_);
+
+    extractRobotStatus();
 
     publishIOData();
     publishToolData();
@@ -450,7 +496,18 @@ void HardwareInterface::read(const ros::Time& time, const ros::Duration& period)
   }
   else
   {
-    ROS_ERROR("Could not get fresh data package from robot");
+    // If reading from RTDE fails, this means that we lost RTDE connection (or that our connection
+    // is not reliable). If we ignore this, the joint_state_controller will continue to publish old
+    // data (e.g. if we unplug the cable from the robot).  However, this also means that any
+    // trajectory execution will be aborted from time to time if the connection to the robot isn't
+    // reliable.
+    // TODO: This doesn't seem too bad currently, but we have to keep this in mind, when we
+    // implement trajectory execution strategies that require a less reliable network connection.
+    controller_reset_necessary_ = true;
+    if (!non_blocking_read_)
+    {
+      ROS_ERROR("Could not get fresh data package from robot");
+    }
   }
 }
 
@@ -458,20 +515,21 @@ void HardwareInterface::write(const ros::Time& time, const ros::Duration& period
 {
   if ((runtime_state_ == static_cast<uint32_t>(rtde_interface::RUNTIME_STATE::PLAYING) ||
        runtime_state_ == static_cast<uint32_t>(rtde_interface::RUNTIME_STATE::PAUSING)) &&
-      robot_program_running_)
+      robot_program_running_ && (!non_blocking_read_ || packet_read_))
   {
     if (position_controller_running_)
     {
-      ur_driver_->writeJointCommand(joint_position_command_);
+      ur_driver_->writeJointCommand(joint_position_command_, comm::ControlMode::MODE_SERVOJ);
     }
-    else if (robot_program_running_)
+    else if (velocity_controller_running_)
     {
-      ur_driver_->writeKeepalive();
+      ur_driver_->writeJointCommand(joint_velocity_command_, comm::ControlMode::MODE_SPEEDJ);
     }
     else
     {
-      ur_driver_->stopControl();
+      ur_driver_->writeKeepalive();
     }
+    packet_read_ = false;
   }
 }
 
@@ -500,18 +558,53 @@ bool HardwareInterface::prepareSwitch(const std::list<hardware_interface::Contro
 void HardwareInterface::doSwitch(const std::list<hardware_interface::ControllerInfo>& start_list,
                                  const std::list<hardware_interface::ControllerInfo>& stop_list)
 {
-  position_controller_running_ = false;
+  for (auto& controller_it : stop_list)
+  {
+    for (auto& resource_it : controller_it.claimed_resources)
+    {
+      if (checkControllerClaims(resource_it.resources))
+      {
+        if (resource_it.hardware_interface == "ur_controllers::ScaledPositionJointInterface")
+        {
+          position_controller_running_ = false;
+        }
+        if (resource_it.hardware_interface == "hardware_interface::PositionJointInterface")
+        {
+          position_controller_running_ = false;
+        }
+        if (resource_it.hardware_interface == "ur_controllers::ScaledVelocityJointInterface")
+        {
+          velocity_controller_running_ = false;
+        }
+        if (resource_it.hardware_interface == "hardware_interface::VelocityJointInterface")
+        {
+          velocity_controller_running_ = false;
+        }
+      }
+    }
+  }
   for (auto& controller_it : start_list)
   {
     for (auto& resource_it : controller_it.claimed_resources)
     {
-      if (resource_it.hardware_interface == "ur_controllers::ScaledPositionJointInterface")
+      if (checkControllerClaims(resource_it.resources))
       {
-        position_controller_running_ = true;
-      }
-      if (resource_it.hardware_interface == "hardware_interface::PositionJointInterface")
-      {
-        position_controller_running_ = true;
+        if (resource_it.hardware_interface == "ur_controllers::ScaledPositionJointInterface")
+        {
+          position_controller_running_ = true;
+        }
+        if (resource_it.hardware_interface == "hardware_interface::PositionJointInterface")
+        {
+          position_controller_running_ = true;
+        }
+        if (resource_it.hardware_interface == "ur_controllers::ScaledVelocityJointInterface")
+        {
+          velocity_controller_running_ = true;
+        }
+        if (resource_it.hardware_interface == "hardware_interface::VelocityJointInterface")
+        {
+          velocity_controller_running_ = true;
+        }
       }
     }
   }
@@ -601,6 +694,59 @@ void HardwareInterface::publishPose()
   }
 }
 
+void HardwareInterface::extractRobotStatus()
+{
+  using namespace rtde_interface;
+
+  robot_status_resource_.mode = robot_status_bits_[toUnderlying(UrRtdeRobotStatusBits::IS_TEACH_BUTTON_PRESSED)] ?
+                                    RobotMode::MANUAL :
+                                    RobotMode::AUTO;
+
+  robot_status_resource_.e_stopped = safety_status_bits_[toUnderlying(UrRtdeSafetyStatusBits::IS_EMERGENCY_STOPPED)] ?
+                                         TriState::TRUE :
+                                         TriState::FALSE;
+
+  // Note that this is true as soon as the drives are powered,
+  // even if the brakes are still closed
+  // which is in slight contrast to the comments in the
+  // message definition
+  robot_status_resource_.drives_powered =
+      robot_status_bits_[toUnderlying(UrRtdeRobotStatusBits::IS_POWER_ON)] ? TriState::TRUE : TriState::FALSE;
+
+  // I found no way to reliably get information if the robot is moving
+  robot_status_resource_.in_motion = TriState::UNKNOWN;
+
+  if ((safety_status_bits_ & in_error_bitset_).any())
+  {
+    robot_status_resource_.in_error = TriState::TRUE;
+  }
+  else
+  {
+    robot_status_resource_.in_error = TriState::FALSE;
+  }
+
+  // Motion is not possible if controller is either in error or in safeguard stop.
+  // TODO: Check status of robot program "external control" here as well
+  if (robot_status_resource_.in_error == TriState::TRUE ||
+      safety_status_bits_[toUnderlying(UrRtdeSafetyStatusBits::IS_SAFEGUARD_STOPPED)])
+  {
+    robot_status_resource_.motion_possible = TriState::FALSE;
+  }
+  else if (robot_mode_ == ur_dashboard_msgs::RobotMode::RUNNING)
+
+  {
+    robot_status_resource_.motion_possible = TriState::TRUE;
+  }
+  else
+  {
+    robot_status_resource_.motion_possible = TriState::FALSE;
+  }
+
+  // the error code, if any, is not transmitted by this protocol
+  // it can and should be fetched separately
+  robot_status_resource_.error_code = 0;
+}
+
 void HardwareInterface::publishIOData()
 {
   if (io_pub_)
@@ -640,7 +786,7 @@ void HardwareInterface::publishToolData()
       tool_data_pub_->msg_.analog_input_range2 = tool_analog_input_types_[0];
       tool_data_pub_->msg_.analog_input_range3 = tool_analog_input_types_[1];
       tool_data_pub_->msg_.analog_input2 = tool_analog_input_[0];
-      tool_data_pub_->msg_.analog_input2 = tool_analog_input_[1];
+      tool_data_pub_->msg_.analog_input3 = tool_analog_input_[1];
       tool_data_pub_->msg_.tool_output_voltage = tool_output_voltage_;
       tool_data_pub_->msg_.tool_current = tool_output_current_;
       tool_data_pub_->msg_.tool_temperature = tool_temperature_;
@@ -794,6 +940,21 @@ void HardwareInterface::publishRobotAndSafetyMode()
       }
     }
   }
+}
+
+bool HardwareInterface::checkControllerClaims(const std::set<std::string>& claimed_resources)
+{
+  for (const std::string& it : joint_names_)
+  {
+    for (const std::string& jt : claimed_resources)
+    {
+      if (it == jt)
+      {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 }  // namespace ur_driver
 

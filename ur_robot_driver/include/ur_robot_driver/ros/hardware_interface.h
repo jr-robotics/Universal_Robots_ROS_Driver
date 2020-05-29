@@ -54,6 +54,8 @@
 #include <ur_dashboard_msgs/RobotMode.h>
 #include <ur_dashboard_msgs/SafetyMode.h>
 
+#include <industrial_robot_status_interface/industrial_robot_status_interface.h>
+
 namespace ur_driver
 {
 /*!
@@ -179,6 +181,12 @@ protected:
   void publishToolData();
   void publishRobotAndSafetyMode();
 
+  /*!
+   * \brief Read and evaluate data in order to set robot status properties for industrial
+   *        robot status interface
+   */
+  void extractRobotStatus();
+
   bool stopControl(std_srvs::TriggerRequest& req, std_srvs::TriggerResponse& res);
 
   template <typename T>
@@ -196,6 +204,14 @@ protected:
   std::unique_ptr<UrDriver> ur_driver_;
   std::unique_ptr<DashboardClientROS> dashboard_client_;
 
+  /*!
+   * \brief Checks whether a resource list contains joints from this hardware interface
+   *
+   * True is returned as soon as one joint name from claimed_resources matches a joint from this
+   * hardware interface.
+   */
+  bool checkControllerClaims(const std::set<std::string>& claimed_resources);
+
   ros::ServiceServer deactivate_srv_;
   ros::ServiceServer tare_sensor_srv_;
 
@@ -203,11 +219,12 @@ protected:
   ur_controllers::ScaledPositionJointInterface spj_interface_;
   hardware_interface::PositionJointInterface pj_interface_;
   ur_controllers::SpeedScalingInterface speedsc_interface_;
-  // hardware_interface::VelocityJointInterface vj_interface_;
+  hardware_interface::VelocityJointInterface vj_interface_;
+  ur_controllers::ScaledVelocityJointInterface svj_interface_;
   hardware_interface::ForceTorqueSensorInterface fts_interface_;
 
   vector6d_t joint_position_command_;
-  // std::vector<double> joint_velocity_command_;
+  vector6d_t joint_velocity_command_;
   vector6d_t joint_positions_;
   vector6d_t joint_velocities_;
   vector6d_t joint_efforts_;
@@ -233,6 +250,8 @@ protected:
   std::vector<std::string> joint_names_;
   int32_t robot_mode_;
   int32_t safety_mode_;
+  std::bitset<4> robot_status_bits_;
+  std::bitset<11> safety_status_bits_;
 
   std::unique_ptr<realtime_tools::RealtimePublisher<tf2_msgs::TFMessage>> tcp_pose_pub_;
   std::unique_ptr<realtime_tools::RealtimePublisher<ur_msgs::IOStates>> io_pub_;
@@ -245,8 +264,12 @@ protected:
   ros::ServiceServer resend_robot_program_srv_;
   ros::Subscriber command_sub_;
 
+  industrial_robot_status_interface::RobotStatus robot_status_resource_{};
+  industrial_robot_status_interface::IndustrialRobotStatusInterface robot_status_interface_{};
+
   uint32_t runtime_state_;
   bool position_controller_running_;
+  bool velocity_controller_running_;
 
   PausingState pausing_state_;
   double pausing_ramp_up_increment_;
@@ -257,6 +280,9 @@ protected:
 
   bool controller_reset_necessary_;
   bool controllers_initialized_;
+
+  bool packet_read_;
+  bool non_blocking_read_;
 
   std::string robot_ip_;
   std::string tf_prefix_;
